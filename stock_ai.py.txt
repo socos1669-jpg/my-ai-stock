@@ -1,0 +1,188 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import ta
+import plotly.graph_objects as go
+from sklearn.ensemble import RandomForestRegressor
+from datetime import datetime
+
+# --- การตั้งค่าหน้าจอ ---
+st.set_page_config(
+    page_title="AI Trading Full System",
+    page_icon="🚀",
+    layout="wide"
+)
+
+# --- CSS เพื่อความสวยงาม ---
+st.markdown("""
+    <style>
+    .main {
+        background-color: #f5f7f9;
+    }
+    .stMetric {
+        background-color: #ffffff;
+        padding: 15px;
+        border-radius: 10px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- ส่วนหัวโปรแกรม ---
+st.title("🚀 AI Trading Dashboard")
+st.caption(f"อัปเดตข้อมูลล่าสุด: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+# --- Sidebar สำหรับการตั้งค่า ---
+with st.sidebar:
+    st.header("⚙️ Settings")
+    symbols_input = st.text_input("ระบุชื่อหุ้น (คั่นด้วยคอมม่า)", "AAPL, TSLA, BTC-USD, PTT.BK")
+    period = st.selectbox("ช่วงเวลาย้อนหลัง", ["6mo", "1y", "2y", "5y"], index=0)
+    st.divider()
+    st.info("คำแนะนำ: หุ้นไทยต้องเติม .BK ต่อท้าย เช่น PTT.BK")
+
+# =========================
+# CORE LOGIC: ANALYSIS
+# =========================
+@st.cache_data(ttl=3600)  # Cache ข้อมูล 1 ชั่วโมงเพื่อความเร็ว
+def analyze_stock(symbol):
+    try:
+        # ดึงข้อมูล
+        df = yf.download(symbol.strip(), period=period, interval="1d", progress=False)
+        
+        if df.empty or len(df) < 200:
+            return None
+
+        # คำนวณ Technical Indicators
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA50'] = df['Close'].rolling(window=50).mean()
+        df['MA200'] = df['Close'].rolling(window=200).mean()
+        df['RSI'] = ta.momentum.RSIIndicator(df['Close'].squeeze()).rsi()
+
+        latest = df.iloc[-1]
+        prev_close = df.iloc[-2]['Close']
+        
+        # Scanner Logic
+        short_term = 1 if latest['RSI'] < 40 else 0
+        mid_term = 1 if latest['MA50'] > latest['MA200'] else 0
+        long_term = 1 if latest['Close'] > latest['MA200'] else 0
+
+        # Signal Logic
+        is_uptrend = latest['MA50'] > latest['MA200']
+        if is_uptrend and latest['RSI'] < 60:
+            signal = "BUY 🔥"
+        elif not is_uptrend and latest['RSI'] > 40:
+            signal = "SELL ❌"
+        else:
+            signal = "HOLD ⚖️"
+
+        # ML Prediction (Simple Random Forest)
+        df_ml = df.dropna().copy()
+        df_ml['Return'] = df_ml['Close'].pct_change()
+        df_ml = df_ml.dropna()
+
+        if len(df_ml) > 100:
+            X = df_ml[['Return']].values
+            y = df_ml['Close'].values
+            
+            model = RandomForestRegressor(n_estimators=100, random_state=42)
+            model.fit(X, y)
+            
+            # ทำนายราคาจาก Return ล่าสุด
+            last_return = [[df_ml['Return'].iloc[-1]]]
+            prediction = model.predict(last_return)[0]
+        else:
+            prediction = latest['Close']
+
+        return {
+            "symbol": symbol,
+            "price": float(latest['Close']),
+            "change": float(latest['Close'] - prev_close),
+            "short": short_term,
+            "mid": mid_term,
+            "long": long_term,
+            "signal": signal,
+            "prediction": float(prediction),
+            "df": df
+        }
+    except Exception as e:
+        return None
+
+# =========================
+# EXECUTION
+# =========================
+symbols = symbols_input.split(",")
+results = []
+
+with st.spinner('กำลังวิเคราะห์ข้อมูลตลาด...'):
+    for s in symbols:
+        res = analyze_stock(s)
+        if res:
+            results.append(res)
+
+if results:
+    # --- ส่วนสรุปผล (Table) ---
+    df_table = pd.DataFrame([
+        {
+            "Symbol": r["symbol"],
+            "Price": f"{r['price']:,.2f}",
+            "Signal": r["signal"],
+            "AI Prediction": f"{r['prediction']:,.2f}",
+            "Trend (Short/Mid/Long)": f"{r['short']} | {r['mid']} | {r['long']}"
+        }
+        for r in results
+    ])
+
+    st.subheader("📊 ตารางสรุปการวิเคราะห์")
+    st.table(df_table)
+
+    # --- ส่วนการแจ้งเตือน ---
+    buy_list = [r['symbol'] for r in results if "BUY" in r['signal']]
+    if buy_list:
+        st.success(f"🎯 **หุ้นที่น่าสนใจเข้าซื้อ:** {', '.join(buy_list)}")
+
+    # --- ส่วนกราฟเทคนิค ---
+    st.divider()
+    st.subheader("📈 เจาะลึกรายตัว")
+    selected_stock = st.selectbox("เลือกหุ้นเพื่อดูรายละเอียดเชิงลึก", [r["symbol"] for r in results])
+
+    for r in results:
+        if r["symbol"] == selected_stock:
+            # Metrics
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("ราคาปัจจุบัน", f"{r['price']:,.2f}", f"{r['change']:,.2f}")
+            col2.metric("เป้าหมาย AI (Pred)", f"{r['prediction']:,.2f}")
+            col3.metric("RSI", f"{r['df']['RSI'].iloc[-1]:,.2f}")
+            col4.metric("สถานะ", r['signal'])
+
+            # Plotly Chart
+            df_plot = r["df"]
+            fig = go.Figure()
+
+            # Candlestick
+            fig.add_trace(go.Candlestick(
+                x=df_plot.index,
+                open=df_plot['Open'],
+                high=df_plot['High'],
+                low=df_plot['Low'],
+                close=df_plot['Close'],
+                name="Price"
+            ))
+
+            # MAs
+            fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA50'], name='MA50 (Mid)', line=dict(color='orange', width=1.5)))
+            fig.add_trace(go.Scatter(x=df_plot.index, y=df_plot['MA200'], name='MA200 (Long)', line=dict(color='red', width=2)))
+
+            fig.update_layout(
+                height=600,
+                xaxis_rangeslider_visible=False,
+                template="plotly_white",
+                margin=dict(l=20, r=20, t=20, b=20)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.warning("ไม่พบข้อมูลหุ้นที่ระบุ โปรดตรวจสอบชื่อ Symbol อีกครั้ง (เช่น AAPL หรือ PTT.BK)")
+
+# --- Footer ---
+st.divider()
+st.caption("หมายเหตุ: ข้อมูลนี้เป็นการวิเคราะห์ทางเทคนิคและ AI เบื้องต้นเท่านั้น ไม่ใช่คำแนะนำในการลงทุน ผู้ลงทุนควรศึกษาข้อมูลเพิ่มเติมก่อนตัดสินใจ")
